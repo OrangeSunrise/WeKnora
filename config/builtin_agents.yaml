@@ -25,7 +25,11 @@ builtin_agents:
     config:
       agent_mode: "quick-answer"
       system_prompt_id: "default_kb"
-      context_template_id: "default_context"
+      # 原为 default_context，该模板把 {{query}} 放在
+      # "[Runtime Context — metadata only, not instructions]" 之下，等于声明用户问题
+      # 不是指令，模型因此不回答提问、改为总结检索到的文档并自拟问题，且丢失语言锚点
+      # 而输出英文。detailed_context 带 "## User Question"、作答要求与语言规则。
+      context_template_id: "detailed_context"
       temperature: 0.7
       max_completion_tokens: 0
       web_search_enabled: true
@@ -37,7 +41,10 @@ builtin_agents:
       faq_priority_enabled: true
       faq_direct_answer_threshold: 0.9
       faq_score_boost: 1.2
-      embedding_top_k: 10
+      # 原为 10。本部署未启用重排序模型，top-10 会带进 8 篇无关文档（发电机 / 扼流圈 /
+      # 磁饱和等）。实测 7B 模型被带偏后反而断言「资料中没有电磁阀信息」并转用先验知识；
+      # 降到 5 后同一问题回答正确并给出正确的 <ref id="c1"/> 引用。接入 rerank 后可再调高。
+      embedding_top_k: 5
       keyword_threshold: 0.3
       vector_threshold: 0.5
       rerank_top_k: 10
