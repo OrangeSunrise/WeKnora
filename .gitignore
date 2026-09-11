@@ -66,8 +66,8 @@ miniprogram/project.private.config.json
 WeKnora-lite.exe
 # DuckDB 动态链接库，按部署说明第 5.2 节自行下载放置
 duckdb.dll
-# 语料构建的中间结果包，约 420MB，超过 GitHub 上限，需要时另行传输
+# 语料构建的中间结果包，419MB，超过 GitHub 单文件 100MB 上限，需要时另行传输
 source/wiki-kb-results.tar.gz
-# 语料发布包（含 131MB 的 Qdrant 快照，整包 156MB 超过 GitHub 单文件上限）
-# 处理方式见 document/文档索引.md「仓库中不含的文件」
+# 语料发布包，内含 131MB 的 Qdrant 快照，整包 155MB，超过 GitHub 单文件 100MB 上限。
+# 处理方式见 document/文档索引.md 的「仓库中不含的文件」一节
 source/*.zip
