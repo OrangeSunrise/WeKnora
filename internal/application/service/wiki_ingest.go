@@ -600,12 +600,18 @@ func enqueueWikiIngestTrigger(
 // because there is no "user upload arriving in waves" pattern to
 // debounce against — a deletion fires once and we want the cleanup
 // to land promptly.
-func EnqueueWikiRetract(
+func EnqueueWikiRetract(ctx context.Context, task interfaces.TaskEnqueuer,
+	pendingRepo interfaces.TaskPendingOpsRepository, payload WikiRetractPayload,
+) {
+	_ = enqueueWikiRetract(ctx, task, pendingRepo, payload)
+}
+
+func enqueueWikiRetract(
 	ctx context.Context,
 	task interfaces.TaskEnqueuer,
 	pendingRepo interfaces.TaskPendingOpsRepository,
 	payload WikiRetractPayload,
-) {
+) error {
 	op := WikiPendingOp{
 		Op:          WikiOpRetract,
 		KnowledgeID: payload.KnowledgeID,
@@ -618,7 +624,7 @@ func EnqueueWikiRetract(
 	payloadBytes, err := json.Marshal(op)
 	if err != nil {
 		logger.Warnf(ctx, "wiki retract: failed to marshal pending op: %v", err)
-		return
+		return err
 	}
 	accepted, err := enqueueWikiPendingOp(ctx, pendingRepo, &types.TaskPendingOp{
 		TenantID: payload.TenantID,
@@ -631,11 +637,11 @@ func EnqueueWikiRetract(
 	})
 	if err != nil {
 		logger.Warnf(ctx, "wiki retract: failed to enqueue pending op: %v", err)
-		return
+		return err
 	}
 	if !accepted {
 		logger.Infof(ctx, "wiki retract: skip enqueue for deleted KB %s", payload.KnowledgeBaseID)
-		return
+		return nil
 	}
 
 	trigger := WikiIngestPayload{
@@ -653,7 +659,9 @@ func EnqueueWikiRetract(
 	)
 	if _, err := task.Enqueue(t); err != nil {
 		logger.Warnf(ctx, "wiki retract: failed to enqueue trigger task: %v", err)
+		return err
 	}
+	return nil
 }
 
 // Handle implements interfaces.TaskHandler for asynq task processing. The
@@ -831,9 +839,9 @@ func (s *wikiIngestService) scheduleFinalizeRetry(ctx context.Context, payload W
 }
 
 // peekPendingList loads up to `limit` ops from task_pending_ops for
-// this KB, ordered FIFO. Rows are NOT removed; callers must
-// DeleteByIDs once they have been consumed (or IncrFailCount + leave
-// them in place for the next pass).
+// this KB, least-failed first (then FIFO). Rows are NOT removed;
+// callers must DeleteByIDs once they have been consumed (or
+// IncrFailCount + leave them in place for the next pass).
 //
 // peekedIDs returns the DB ids of every row included in the peek
 // (NOT just the ones that survived dedup) so trimPendingList can
@@ -1173,8 +1181,10 @@ func (s *wikiIngestService) finalizeWikiSubtask(ctx context.Context, knowledgeID
 //     so a single round trip handles both bookkeeping and retry-budget
 //     check.
 //   - If the count is <= wikiMaxFailRetries: leave the row in place.
-//     The next follow-up batch's PeekBatch will pick it up naturally
-//     (rows are ordered by id ASC and we never moved/touched it).
+//     The next follow-up batch's ClaimBatch / PeekBatch will pick it
+//     up after never-attempted work (both order by fail_count ASC,
+//     then id ASC). The row is not moved, so the fail_count budget
+//     keeps counting down.
 //   - If the count exceeds the retry cap: archive the op into
 //     task_dead_letters and DeleteByIDs to remove it from the queue.
 //     Settlement failures are returned so the caller does not mark claims
@@ -1195,8 +1205,8 @@ func (s *wikiIngestService) requeueFailedOps(ctx context.Context, payload WikiIn
 			logger.Warnf(ctx, "wiki ingest: failed to increment fail count for %s (id=%d): %v", op.KnowledgeID, op.dbID, err)
 			settleErrs = append(settleErrs, fmt.Errorf("increment fail count id=%d: %w", op.dbID, err))
 			// Without a fresh count we can't tell whether to drop. Be
-			// conservative: leave the row in place; the next PeekBatch
-			// will see it again and we'll try once more.
+			// conservative: leave the row in place; the next ClaimBatch
+			// / PeekBatch will see it again and we'll try once more.
 			continue
 		}
 		if count <= wikiMaxFailRetries {

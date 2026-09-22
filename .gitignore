@@ -63,3 +63,5 @@ miniprogram/project.private.config.json
 
 # jianhui
 jianhui/
+# Locally built BrowserSkill runtime and extension bundles
+/artifacts/browserskill/
