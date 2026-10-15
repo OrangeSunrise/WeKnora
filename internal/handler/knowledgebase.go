@@ -303,17 +303,64 @@ func (h *KnowledgeBaseHandler) resolveKBStoreView(
 	return view
 }
 
+// KnowledgeBaseJSON is the encoding/json form of a knowledge base: the struct
+// fields plus the computed capabilities object added by MarshalJSON.
+// Doc-only; handlers still serialize *types.KnowledgeBase directly.
+type KnowledgeBaseJSON struct {
+	types.KnowledgeBase
+	Capabilities types.KBCapabilities `json:"capabilities"`
+}
+
+// KnowledgeBaseView is KnowledgeBaseJSON plus the optional vector-store
+// display fields buildKBResponse merges in. Shared responses omit
+// vector_store_id; owned responses include it via the embedded struct.
+type KnowledgeBaseView struct {
+	KnowledgeBaseJSON
+	VectorStoreName       string `json:"vector_store_name,omitempty"`
+	VectorStoreSource     string `json:"vector_store_source,omitempty"`
+	VectorStoreEngineType string `json:"vector_store_engine_type,omitempty"`
+	VectorStoreStatus     string `json:"vector_store_status,omitempty"`
+	// MyPermission is the caller's role on a knowledge base shared from
+	// another workspace; GET /knowledge-bases/{id} sets it.
+	MyPermission string `json:"my_permission,omitempty" enums:"admin,editor,viewer" extensions:"x-agent"`
+}
+
+// HybridSearchResponse is the hybrid-search body. meta is set only when the
+// request enabled rerank.
+type HybridSearchResponse struct {
+	Success bool                  `json:"success" example:"true"`
+	Data    []*types.SearchResult `json:"data"`
+	Meta    *types.RetrievalMeta  `json:"meta,omitempty"`
+}
+
+// DuplicateKnowledgeBaseData is the data object of POST /knowledge-bases/{id}/duplicate.
+type DuplicateKnowledgeBaseData struct {
+	SourceID      string            `json:"source_id"`
+	TargetID      string            `json:"target_id"`
+	Message       string            `json:"message"`
+	KnowledgeBase KnowledgeBaseView `json:"knowledge_base"`
+}
+
+// ImageAttrSchemaData is the data object of GET /image-attrs/schema.
+type ImageAttrSchemaData struct {
+	Version        string                   `json:"version"`
+	Prompt         string                   `json:"prompt"`
+	Attributes     []types.AttrSpec         `json:"attributes"`
+	DefaultActions types.ImageActionsConfig `json:"default_actions"`
+}
+
 // HybridSearch godoc
 // @Summary      混合搜索
-// @Description  在知识库中执行向量和关键词混合搜索。推荐使用 POST；GET 携带 JSON 请求体仍受支持（兼容旧客户端）。
+// @Description  底层召回：向量+关键词混合检索，默认不 rerank（可用 rerank 字段开启）；一般检索请用 /knowledge-search。推荐 POST，GET 带 JSON 体仅兼容旧客户端。
 // @Tags         知识库
 // @Accept       json
 // @Produce      json
 // @Param        id             path      string             true   "知识库ID"
 // @Param        request        body      types.SearchParams true   "搜索参数"
 // @Param        resource_urls  query     string  false  "文件引用形式，public 返回可加载直链"  Enums(handle, public)  default(handle)
-// @Success      200            {object}  map[string]interface{}  "搜索结果"
-// @Failure      400            {object}  errors.AppError         "请求参数错误"
+// @Success      200            {object}  handler.HybridSearchResponse  "搜索结果"
+// @Failure      400            {object}  errors.AppError               "请求参数错误"
+// @Failure      404            {object}  errors.AppError               "知识库不存在"
 // @Security     Bearer
 // @Security     ApiKeyAuth
 // @Router       /knowledge-bases/{id}/hybrid-search [post]
@@ -342,6 +389,15 @@ func (h *KnowledgeBaseHandler) HybridSearch(c *gin.Context) {
 		_ = c.Error(apperrors.NewBadRequestError("query_text is required"))
 		return
 	}
+	if err := req.Rerank.Validate(); err != nil {
+		_ = c.Error(apperrors.NewBadRequestError(err.Error()))
+		return
+	}
+	if req.Rerank.IsEnabled() && strings.TrimSpace(req.QueryText) == "" {
+		// The rerank model scores passages against the query text.
+		_ = c.Error(apperrors.NewBadRequestError("query_text is required when rerank is enabled"))
+		return
+	}
 
 	logger.Infof(ctx, "Executing hybrid search, knowledge base ID: %s, query: %s, effectiveTenantID: %d",
 		secutils.SanitizeForLog(id), secutils.SanitizeForLog(req.QueryText), effectiveTenantID)
@@ -354,9 +410,17 @@ func (h *KnowledgeBaseHandler) HybridSearch(c *gin.Context) {
 		return
 	}
 
-	// Execute hybrid search with default search parameters
+	// Execute hybrid search. Without a rerank object this is the raw recall
+	// primitive it has always been; with one, the response carries meta.
 	// Note: For shared KBs, the service uses effectiveTenantID internally via context
-	results, err := h.service.HybridSearch(c.Request.Context(), id, req)
+	var retrieval *types.RetrievalResult
+	if req.Rerank != nil {
+		retrieval, err = h.service.HybridSearchWithRerank(c.Request.Context(), id, req)
+	} else {
+		var results []*types.SearchResult
+		results, err = h.service.HybridSearch(c.Request.Context(), id, req)
+		retrieval = &types.RetrievalResult{Results: results}
+	}
 	if err != nil {
 		// Service-layer typed AppErrors (e.g. ErrVectorStoreBindingInvalid,
 		// ErrVectorStoreUnavailable, BadRequest from multi-store fan-out)
@@ -373,11 +437,15 @@ func (h *KnowledgeBaseHandler) HybridSearch(c *gin.Context) {
 	}
 
 	logger.Infof(ctx, "Hybrid search completed, knowledge base ID: %s, result count: %d",
-		secutils.SanitizeForLog(id), len(results))
-	c.JSON(http.StatusOK, gin.H{
+		secutils.SanitizeForLog(id), len(retrieval.Results))
+	response := gin.H{
 		"success": true,
-		"data":    rewriter.CopyReferences(ctx, results),
-	})
+		"data":    rewriter.CopyReferences(ctx, retrieval.Results),
+	}
+	if retrieval.Meta.Rerank != nil {
+		response["meta"] = retrieval.Meta
+	}
+	c.JSON(http.StatusOK, response)
 }
 
 // CreateKnowledgeBase godoc
@@ -387,8 +455,9 @@ func (h *KnowledgeBaseHandler) HybridSearch(c *gin.Context) {
 // @Accept       json
 // @Produce      json
 // @Param        request  body      types.KnowledgeBase  true  "知识库信息"
-// @Success      201      {object}  map[string]interface{}  "创建的知识库"
-// @Failure      400      {object}  errors.AppError         "请求参数错误"
+// @Success      201      {object}  handler.DataResponse{data=handler.KnowledgeBaseView}  "创建的知识库"
+// @Failure      400      {object}  errors.AppError                                      "请求参数错误"
+// @Failure      500      {object}  errors.AppError                                      "服务器错误"
 // @Security     Bearer
 // @Security     ApiKeyAuth
 // @Router       /knowledge-bases [post]
@@ -470,13 +539,16 @@ func (h *KnowledgeBaseHandler) validateAndGetKnowledgeBase(
 // @Tags         知识库
 // @Accept       json
 // @Produce      json
-// @Param        id         path      string  true   "知识库ID"
+// @Param        id         path      string  true   "知识库ID"  extensions(x-agent=knowledge_base_id)
 // @Param        agent_id   query     string  false  "共享智能体 ID（用于校验智能体是否有权访问该知识库）"
-// @Success      200  {object}  map[string]interface{}  "知识库详情"
-// @Failure      400  {object}  errors.AppError         "请求参数错误"
-// @Failure      404  {object}  errors.AppError         "知识库不存在"
+// @Success      200  {object}  handler.DataResponse{data=handler.KnowledgeBaseView}  "知识库详情"
+// @Failure      400  {object}  errors.AppError  "请求参数错误"
+// @Failure      403  {object}  errors.AppError  "无权访问知识库"
+// @Failure      404  {object}  errors.AppError  "知识库不存在"
 // @Security     Bearer
 // @Security     ApiKeyAuth
+// @x-agent      {"id":"knowledge_base.get","risk":"read"}
+// @x-agent-hint "Check which indexes are enabled (vector, keyword, Wiki, graph) and whether documents are processing."
 // @Router       /knowledge-bases/{id} [get]
 func (h *KnowledgeBaseHandler) GetKnowledgeBase(c *gin.Context) {
 	// Validate and get the knowledge base
@@ -506,8 +578,10 @@ func (h *KnowledgeBaseHandler) GetKnowledgeBase(c *gin.Context) {
 // @Accept       json
 // @Produce      json
 // @Param        agent_id  query     string  false  "共享智能体 ID（传入时返回该智能体可用的知识库）"
-// @Success      200  {object}  map[string]interface{}  "知识库列表"
-// @Failure      500  {object}  errors.AppError         "服务器错误"
+// @Param        creator   query     string  false  "按创建者过滤，仅 mine 与 others 生效"  Enums(mine, others)
+// @Success      200       {object}  handler.DataResponse{data=[]handler.KnowledgeBaseView}  "知识库列表"
+// @Failure      400       {object}  errors.AppError                                         "请求参数错误"
+// @Failure      500       {object}  errors.AppError                                         "服务器错误"
 // @Security     Bearer
 // @Security     ApiKeyAuth
 // @Router       /knowledge-bases [get]
@@ -680,8 +754,10 @@ func pickUserDisplayName(u *types.User) string {
 // @Accept       json
 // @Produce      json
 // @Param        id  path      string  true  "知识库ID"
-// @Success      200  {object}  map[string]interface{}  "更新后的知识库"
-// @Failure      404  {object}  errors.AppError         "知识库不存在"
+// @Success      200  {object}  handler.DataResponse{data=handler.KnowledgeBaseView}  "更新后的知识库"
+// @Failure      400  {object}  errors.AppError                                      "请求参数错误"
+// @Failure      404  {object}  errors.AppError                                      "知识库不存在"
+// @Failure      500  {object}  errors.AppError                                      "服务器错误"
 // @Security     Bearer
 // @Security     ApiKeyAuth
 // @Router       /knowledge-bases/{id}/pin [put]
@@ -716,6 +792,10 @@ type UpdateKnowledgeBaseRequest struct {
 	Name        string                     `json:"name"        binding:"required"`
 	Description string                     `json:"description"`
 	Config      *types.KnowledgeBaseConfig `json:"config"`
+	// VLMConfig updates the knowledge base's multimodal (vision) config.
+	// Optional: nil means "no change", mirroring how CreateKnowledgeBase
+	// accepts a top-level vlm_config.
+	VLMConfig *types.VLMConfig `json:"vlm_config"`
 }
 
 // UpdateKnowledgeBase godoc
@@ -726,8 +806,10 @@ type UpdateKnowledgeBaseRequest struct {
 // @Produce      json
 // @Param        id       path      string                     true  "知识库ID"
 // @Param        request  body      UpdateKnowledgeBaseRequest true  "更新请求"
-// @Success      200      {object}  map[string]interface{}     "更新后的知识库"
-// @Failure      400      {object}  errors.AppError            "请求参数错误"
+// @Success      200      {object}  handler.DataResponse{data=handler.KnowledgeBaseView}  "更新后的知识库"
+// @Failure      400      {object}  errors.AppError                                      "请求参数错误"
+// @Failure      403      {object}  errors.AppError                                      "无权限"
+// @Failure      404      {object}  errors.AppError                                      "知识库不存在"
 // @Security     Bearer
 // @Security     ApiKeyAuth
 // @Router       /knowledge-bases/{id} [put]
@@ -736,7 +818,7 @@ func (h *KnowledgeBaseHandler) UpdateKnowledgeBase(c *gin.Context) {
 	logger.Info(ctx, "Start updating knowledge base")
 
 	// Validate and get the knowledge base
-	_, id, _, permission, err := h.validateAndGetKnowledgeBase(c)
+	currentKB, id, _, permission, err := h.validateAndGetKnowledgeBase(c)
 	if err != nil {
 		c.Error(err)
 		return
@@ -755,12 +837,22 @@ func (h *KnowledgeBaseHandler) UpdateKnowledgeBase(c *gin.Context) {
 		c.Error(apperrors.NewBadRequestError("Invalid request parameters").WithDetails(err.Error()))
 		return
 	}
+	// The VLM model is a KB setting: like PUT /initialization/config, only the
+	// owner workspace or an admin share may change it, not a share editor.
+	if req.VLMConfig != nil {
+		if _, err := kbSettingsAccess(c, currentKB); err != nil {
+			_ = c.Error(err)
+			return
+		}
+	}
 	if req.Config != nil {
 		probe := &types.KnowledgeBase{
-			ChunkingConfig:        req.Config.ChunkingConfig,
-			ImageProcessingConfig: req.Config.ImageProcessingConfig,
-			WikiConfig:            req.Config.WikiConfig,
-			ProfileConfig:         req.Config.ProfileConfig,
+			ChunkingConfig: req.Config.ChunkingConfig,
+			WikiConfig:     req.Config.WikiConfig,
+			ProfileConfig:  req.Config.ProfileConfig,
+		}
+		if req.Config.ImageProcessingConfig != nil {
+			probe.ImageProcessingConfig = *req.Config.ImageProcessingConfig
 		}
 		if err := validateKnowledgeBasePromptInstructions(probe); err != nil {
 			c.Error(err)
@@ -772,8 +864,13 @@ func (h *KnowledgeBaseHandler) UpdateKnowledgeBase(c *gin.Context) {
 		secutils.SanitizeForLog(id), secutils.SanitizeForLog(req.Name))
 
 	// Update the knowledge base
-	kb, err := h.service.UpdateKnowledgeBase(ctx, id, req.Name, req.Description, req.Config)
+	kb, err := h.service.UpdateKnowledgeBase(ctx, id, req.Name, req.Description, req.Config, req.VLMConfig)
 	if err != nil {
+		// A rejected vlm_config is the caller's mistake, not a server failure.
+		if appErr, ok := apperrors.IsAppError(err); ok {
+			_ = c.Error(appErr)
+			return
+		}
 		logger.ErrorWithFields(ctx, err, nil)
 		c.Error(apperrors.NewInternalServerError(err.Error()))
 		return
@@ -794,8 +891,10 @@ func (h *KnowledgeBaseHandler) UpdateKnowledgeBase(c *gin.Context) {
 // @Tags         知识库
 // @Produce      json
 // @Param        id   path      string  true  "知识库ID"
-// @Success      200  {object}  map[string]interface{}  "生成的知识库画像"
-// @Failure      400  {object}  errors.AppError         "知识库类型不支持或未配置模型"
+// @Success      200  {object}  handler.DataResponse{data=types.KnowledgeBaseProfile}  "生成的知识库画像"
+// @Failure      400  {object}  errors.AppError                                       "知识库类型不支持或未配置模型"
+// @Failure      403  {object}  errors.AppError                                       "无权限"
+// @Failure      404  {object}  errors.AppError                                       "知识库不存在"
 // @Security     Bearer
 // @Security     ApiKeyAuth
 // @Router       /knowledge-bases/{id}/profile/generate [post]
@@ -843,8 +942,10 @@ const knowledgeBaseProfileRequestTimeout = 2 * time.Minute
 // @Accept       json
 // @Produce      json
 // @Param        id   path      string  true  "知识库ID"
-// @Success      200  {object}  map[string]interface{}  "删除成功"
-// @Failure      400  {object}  errors.AppError         "请求参数错误"
+// @Success      200  {object}  handler.MessageResponse  "删除成功"
+// @Failure      400  {object}  errors.AppError          "请求参数错误"
+// @Failure      403  {object}  errors.AppError          "仅所有者可删除"
+// @Failure      404  {object}  errors.AppError          "知识库不存在"
 // @Security     Bearer
 // @Security     ApiKeyAuth
 // @Router       /knowledge-bases/{id} [delete]
@@ -912,8 +1013,10 @@ type DuplicateKnowledgeBaseResponse struct {
 // @Accept       json
 // @Produce      json
 // @Param        request  body      CopyKnowledgeBaseRequest   true  "复制请求"
-// @Success      200      {object}  map[string]interface{}     "任务ID"
-// @Failure      400      {object}  errors.AppError            "请求参数错误"
+// @Success      200      {object}  handler.DataResponse{data=handler.CopyKnowledgeBaseResponse}  "任务ID"
+// @Failure      400      {object}  errors.AppError                                              "请求参数错误"
+// @Failure      401      {object}  errors.AppError                                              "未认证"
+// @Failure      403      {object}  errors.AppError                                              "无权限"
 // @Security     Bearer
 // @Security     ApiKeyAuth
 // @Router       /knowledge-bases/copy [post]
@@ -1064,8 +1167,10 @@ func (h *KnowledgeBaseHandler) CopyKnowledgeBase(c *gin.Context) {
 // @Accept       json
 // @Produce      json
 // @Param        id       path      string                  true  "源知识库 ID"
-// @Success      201      {object}  map[string]interface{}  "创建后的知识库副本"
-// @Failure      400      {object}  errors.AppError                 "请求参数错误"
+// @Success      201      {object}  handler.DataResponse{data=handler.DuplicateKnowledgeBaseData}  "创建后的知识库副本"
+// @Failure      400      {object}  errors.AppError                                               "请求参数错误"
+// @Failure      403      {object}  errors.AppError                                               "无权限"
+// @Failure      404      {object}  errors.AppError                                               "知识库不存在"
 // @Security     Bearer
 // @Router       /knowledge-bases/{id}/duplicate [post]
 func (h *KnowledgeBaseHandler) DuplicateKnowledgeBase(c *gin.Context) {
@@ -1130,8 +1235,9 @@ func (h *KnowledgeBaseHandler) DuplicateKnowledgeBase(c *gin.Context) {
 // @Accept       json
 // @Produce      json
 // @Param        task_id  path      string  true  "任务ID"
-// @Success      200      {object}  map[string]interface{}  "进度信息"
-// @Failure      404      {object}  errors.AppError         "任务不存在"
+// @Success      200      {object}  handler.DataResponse{data=types.KBCloneProgress}  "进度信息"
+// @Failure      400      {object}  errors.AppError                                  "请求参数错误"
+// @Failure      404      {object}  errors.AppError                                  "任务不存在"
 // @Security     Bearer
 // @Security     ApiKeyAuth
 // @Router       /knowledge-bases/copy/progress/{task_id} [get]
@@ -1244,9 +1350,11 @@ func validateKnowledgeBasePromptInstructions(kb *types.KnowledgeBase) error {
 // @Tags         知识库
 // @Produce      json
 // @Param        id   path      string                  true  "源知识库 ID"
-// @Success      200  {object}  map[string]interface{}  "可移动目标列表"
-// @Failure      400  {object}  errors.AppError         "请求参数错误"
-// @Failure      404  {object}  errors.AppError         "知识库不存在"
+// @Success      200  {object}  handler.DataResponse{data=[]types.KnowledgeBase}  "可移动目标列表"
+// @Failure      400  {object}  errors.AppError                                   "请求参数错误"
+// @Failure      401  {object}  errors.AppError                                   "未认证"
+// @Failure      403  {object}  errors.AppError                                   "无权限"
+// @Failure      404  {object}  errors.AppError                                   "知识库不存在"
 // @Security     Bearer
 // @Security     ApiKeyAuth
 // @Router       /knowledge-bases/{id}/move-targets [get]
@@ -1308,5 +1416,26 @@ func (h *KnowledgeBaseHandler) ListMoveTargets(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{
 		"success": true,
 		"data":    targets,
+	})
+}
+
+// GetImageAttrsSchema godoc
+// @Summary      获取图片属性字典
+// @Description  返回当前版本的图片属性注册表、提示词版本和默认动作。全局只读，不绑定知识库。
+// @Tags         知识库
+// @Produce      json
+// @Success      200  {object}  handler.DataResponse{data=handler.ImageAttrSchemaData}
+// @Security     Bearer
+// @Security     ApiKeyAuth
+// @Router       /image-attrs/schema [get]
+func (h *KnowledgeBaseHandler) GetImageAttrsSchema(c *gin.Context) {
+	c.JSON(http.StatusOK, gin.H{
+		"success": true,
+		"data": gin.H{
+			"version":         types.ImageAttrSchemaVersion,
+			"prompt":          types.ImageAttrPromptVersion,
+			"attributes":      types.ImageAttrRegistry,
+			"default_actions": types.DefaultImageActions(),
+		},
 	})
 }

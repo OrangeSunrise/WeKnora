@@ -8,6 +8,7 @@ import (
 
 	"github.com/Tencent/WeKnora/internal/agent/skills"
 	"github.com/Tencent/WeKnora/internal/config"
+	"github.com/Tencent/WeKnora/internal/sandbox"
 	"github.com/Tencent/WeKnora/internal/types"
 )
 
@@ -61,6 +62,31 @@ type QuestionOriginInfo struct {
 	KnowledgeBaseID   string
 	KnowledgeBaseName string
 	Document          *SelectedDocumentInfo // nil when only the base is known
+}
+
+// PageContextInfo is the WeKnora page the user has open, with every part
+// checked to exist in the knowledge base. Rendered into runtime_context so
+// "this document" or "these issues" resolve without the model asking.
+type PageContextInfo struct {
+	KnowledgeBaseID   string
+	KnowledgeBaseName string
+	Document          *SelectedDocumentInfo // nil unless a document is open
+	WikiPage          *PageContextWikiPage  // nil unless a Wiki page is open
+	WikiIssues        []*PageContextWikiIssue
+}
+
+// PageContextWikiPage is the Wiki page open in a page context.
+type PageContextWikiPage struct {
+	Slug  string
+	Title string
+}
+
+// PageContextWikiIssue is a Wiki issue shown on the page the user has open.
+type PageContextWikiIssue struct {
+	ID        string
+	Slug      string
+	IssueType string
+	Status    string
 }
 
 // PinnedMCPServiceInfo describes an MCP service explicitly @mentioned for this turn.
@@ -258,10 +284,10 @@ func formatSkillsMetadata(skillsMetadata []*skills.SkillMetadata, shellExecEnabl
 // formatToolGuidance uses the actual registry, so disabled capabilities never
 // leak into the runtime instructions. Mechanics and limits live in tool schemas.
 func formatToolGuidance(names []string) string {
-	return formatToolGuidanceForMode(names, false)
+	return formatToolGuidanceForMode(names, false, sandbox.WorkspaceLayout{})
 }
 
-func formatToolGuidanceForMode(names []string, skillInstallMode bool) string {
+func formatToolGuidanceForMode(names []string, skillInstallMode bool, layout sandbox.WorkspaceLayout) string {
 	if len(names) == 0 {
 		return ""
 	}
@@ -290,13 +316,31 @@ func formatToolGuidanceForMode(names []string, skillInstallMode bool) string {
 			"read_file(path=skill://<name>/<file_path or SKILL.md>) and read_sandbox_file to read_file.\n")
 	}
 	if !skillInstallMode && (has("shell_exec") || has("write_sandbox_file")) {
-		b.WriteString("Session workspace: /workspace. Preserve uploaded originals in /workspace/input. " +
-			skills.ArtifactOutputDir() + " is the only directory collected for download, " +
-			"so it takes finished deliverables only; " +
-			"keep drafts and intermediate files in another directory under /workspace. " +
-			"Commands start from their specified working directory on every call. " +
-			"Files and installed packages persist within the session.\n")
-		b.WriteString(sandboxArtifactReferenceGuidance())
+		if layout.IsHost() {
+			// A host root is a directory the user picked. PromptSafePath
+			// refuses names carrying newlines or markup rather than
+			// sanitizing them, so a forged instruction cannot reach the
+			// model and a real path is never shown altered. Without a
+			// usable root the workspace line is omitted entirely, which is
+			// the same fail-closed shape as a failed layout lookup.
+			if root := sandbox.PromptSafePath(layout.Root); root != "" {
+				b.WriteString("Session workspace: ")
+				b.WriteString(root)
+				b.WriteString(". Edit files in place under that folder. Commands start from ")
+				b.WriteString(root)
+				b.WriteString(" on every call unless work_dir names a subdirectory. " +
+					"Files persist on the user's machine.\n")
+			}
+		} else {
+			b.WriteString("Session workspace: /workspace. Preserve uploaded originals in /workspace/input. ")
+			b.WriteString(skills.ArtifactOutputDir())
+			b.WriteString(" is the only directory collected for download, " +
+				"so it takes finished deliverables only; " +
+				"keep drafts and intermediate files in another directory under /workspace. " +
+				"Commands start from their specified working directory on every call. " +
+				"Files and installed packages persist within the session.\n")
+			b.WriteString(sandboxArtifactReferenceGuidance())
+		}
 	}
 	if !skillInstallMode && has("shell_exec") && has("read_file") {
 		b.WriteString("For listed skills, run bundled scripts and your own scripts with " +
@@ -392,6 +436,7 @@ type BuildSystemPromptOptions struct {
 	Config           *config.Config // Config for reading prompt templates; nil leaves the default base empty
 	MemoryPrompt     string
 	ProtocolPrompt   string
+	WorkspaceLayout  sandbox.WorkspaceLayout
 }
 
 // BuildSystemPrompt builds the progressive RAG system prompt
@@ -480,6 +525,10 @@ func BuildSystemPromptSections(
 		names = options.SelectedTools
 	}
 	skillInstallMode := options != nil && options.SkillInstallMode
+	var layout sandbox.WorkspaceLayout
+	if options != nil {
+		layout = options.WorkspaceLayout
+	}
 	sources := formatGroundingGuidance(names)
 	if skillInstallMode {
 		sources = "Installation verification: inspect the supplied skill and dependency " +
@@ -488,7 +537,7 @@ func BuildSystemPromptSections(
 			"as part of installation."
 	}
 	sections = append(sections, SystemPromptSection{"sources", sources},
-		SystemPromptSection{"tools", formatToolGuidanceForMode(names, skillInstallMode)},
+		SystemPromptSection{"tools", formatToolGuidanceForMode(names, skillInstallMode, layout)},
 		SystemPromptSection{"output", types.SourcedAnswerOutputPrompt})
 	if options != nil {
 		if !skillInstallMode && slices.Contains(names, "read_file") && len(options.SkillsMetadata) > 0 {

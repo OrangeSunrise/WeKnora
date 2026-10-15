@@ -3,7 +3,10 @@
         'is-embedded': embeddedMode,
         'has-references-panel': referencesDrawerVisible,
         'has-sandbox-panel': sandboxPanel.visible.value,
-    }" :style="{ '--sandbox-panel-width': `${sandboxPanel.width.value}px` }">
+    }" :style="{
+        '--sandbox-panel-width': `${sandboxPanel.width.value}px`,
+        '--references-panel-width': `${referencesPanelWidth}px`,
+    }">
         <div v-if="!embeddedMode" class="chat-topbar">
             <ChatHeader :session="currentSession" />
             <div v-if="!sandboxPanel.visible.value" class="sandbox-header-toggle">
@@ -22,7 +25,7 @@
                 </t-tooltip>
             </div>
         </div>
-        <div class="chat_thread" :style="{ '--chat-composer-height': `${composerHeight}px` }">
+        <div class="chat_thread" :style="{ '--chat-composer-height': `${composerHeight}px`, '--chat-scrollbar-gutter': `${scrollbarGutter}px` }">
             <div ref="scrollContainer" class="chat_scroll_box" @scroll="handleScroll">
                 <div class="chat_scroll_content">
                     <div class="msg_list" :class="{ 'is-embedded': embeddedMode }">
@@ -105,8 +108,7 @@
                                 :value="session.created_at" />
 
                             <div v-if="session.role == 'user'" class="message-row"
-                                :data-message-id="session.id || undefined"
-                                :class="{ 'is-minimap-target': session.id && session.id === minimapTargetId }">
+                                :data-message-id="session.id || undefined">
                                 <usermsg :content="session.content" :mentioned_items="session.mentioned_items"
                                     :images="session.images" :attachments="session.attachments" :embeddedMode="embeddedMode"
                                     :session-id="session_id"
@@ -149,26 +151,27 @@
                             <span class="chat-global-wait__spinner" aria-hidden="true"></span>
                         </div>
                     </div>
-                    <div ref="composerElement" class="chat_composer">
-                        <div class="input-container" :class="{ 'is-embedded': embeddedMode }">
-                            <transition name="scroll-btn-fade">
-                                <div v-show="userHasScrolledUp" class="scroll-to-bottom-btn" @click="onClickScrollToBottom">
-                                    <t-icon name="chevron-down" size="18px" />
-                                </div>
-                            </transition>
-                            <InputField ref="inputFieldRef" :auto-focus="focusComposerOnMount" :compact="!embeddedMode"
-                                @send-msg="(query, modelId, mentionedItems, imageFiles, attachmentFiles, options) => sendMsg(query, modelId, mentionedItems, imageFiles, attachmentFiles, options)"
-                                @steer-msg="(query, mentionedItems, delivery) => handleSteerMsg(query, mentionedItems, delivery)"
-                                @promote-steer="handlePromoteSteer"
-                                @remove-steer="handleRemoveSteer"
-                                @retry-steer="handleRetrySteer"
-                                @stop-generation="handleStopGeneration"
-                                @stop-confirmed="handleStopConfirmed"
-                                @stop-failed="handleStopFailed" :isReplying="isReplying" :composer-locked="composerLocked" :sessionId="session_id"
-                                :assistantMessageId="currentAssistantMessageId" :embeddedMode="embeddedMode"
-                                :queuedSteers="steerQueue.filter(item => item.delivery === 'after')" :canSteer="isAgentStreamSession()"></InputField>
+                </div>
+            </div>
+            <div ref="composerElement" class="chat_composer">
+                <div class="input-container" :class="{ 'is-embedded': embeddedMode }">
+                    <transition name="scroll-btn-fade">
+                        <div v-show="userHasScrolledUp" class="scroll-to-bottom-btn" @click="onClickScrollToBottom">
+                            <t-icon name="chevron-down" size="18px" />
                         </div>
-                    </div>
+                    </transition>
+                    <PendingPromptDock :embedded-mode="embeddedMode" />
+                    <InputField ref="inputFieldRef" :auto-focus="focusComposerOnMount" :compact="!embeddedMode"
+                        @send-msg="(query, modelId, mentionedItems, imageFiles, attachmentFiles, options) => sendMsg(query, modelId, mentionedItems, imageFiles, attachmentFiles, options)"
+                        @steer-msg="(query, mentionedItems, delivery) => handleSteerMsg(query, mentionedItems, delivery)"
+                        @promote-steer="handlePromoteSteer"
+                        @remove-steer="handleRemoveSteer"
+                        @retry-steer="handleRetrySteer"
+                        @stop-generation="handleStopGeneration"
+                        @stop-confirmed="handleStopConfirmed"
+                        @stop-failed="handleStopFailed" :isReplying="isReplying" :composer-locked="composerLocked" :sessionId="session_id"
+                        :assistantMessageId="currentAssistantMessageId" :embeddedMode="embeddedMode"
+                        :queuedSteers="steerQueue.filter(item => item.delivery === 'after')" :canSteer="isAgentStreamSession()"></InputField>
                 </div>
             </div>
             <div v-if="!embeddedMode" class="chat_overlays">
@@ -187,13 +190,14 @@
         :agent-id="useSettingsStoreInstance.selectedAgentId"
         :agent-source-tenant-id="useSettingsStoreInstance.selectedAgentSourceTenantId"
         :shifted="referencesDrawerVisible"
+        :shift-width="referencesPanelWidth"
         :artifacts="sessionArtifacts" :artifacts-collecting="sessionArtifactsCollecting"
         @artifact-deleted="handleArtifactDeleted" />
 </template>
 <script setup>
 import { makeSteerClientId } from '@/utils/steerId';
 import { storeToRefs } from 'pinia';
-import { ref, onMounted, onBeforeMount, onUnmounted, nextTick, watch, reactive, computed } from 'vue';
+import { ref, onMounted, onBeforeMount, onUnmounted, nextTick, watch, reactive, computed, provide } from 'vue';
 import { useRoute, useRouter, onBeforeRouteLeave, onBeforeRouteUpdate } from 'vue-router';
 import InputField from '../../components/Input-field.vue';
 import botmsg from './components/botmsg.vue';
@@ -208,6 +212,7 @@ import { deleteTemporaryAttachment, uploadTemporaryAttachment } from '@/api/chat
 import { useStream } from '../../api/chat/streame'
 import { listSteerSession, promoteSteerSession, removeSteerSession, steerSession } from '@/api/chat/steer';
 import { persistedAssistantId, previewSteerMessage, discardSteerPreview, reconcileSteerMessageId } from '@/utils/steerStreamFork';
+import { resumeSuspendedRunKey } from '@/utils/suspendedRun';
 import { useMenuStore } from '@/stores/menu';
 import { useSettingsStore } from '@/stores/settings';
 import { useBrowserConnectionStore } from '@/stores/browserConnection';
@@ -216,7 +221,7 @@ import { useI18n } from 'vue-i18n';
 import { useUIStore } from '@/stores/ui';
 import KnowledgeBaseEditorModal from '@/views/knowledge/KnowledgeBaseEditorModal.vue';
 import { useKnowledgeBaseCreationNavigation } from '@/hooks/useKnowledgeBaseCreationNavigation';
-import { useChatStreamHandler } from '@/composables/useChatStreamHandler';
+import { useChatStreamHandler, isAwaitingInput, isPromptCard } from '@/composables/useChatStreamHandler';
 import { useStickyBottomOnResize } from '@/composables/useStickyBottomOnResize';
 import { clearCitationChunkCache } from '@/utils/citationChunkCache';
 import ChatReferencesDrawer from '@/components/ChatReferencesDrawer.vue';
@@ -241,12 +246,14 @@ import { useSessionActivityStore } from '@/stores/sessionActivity';
 import { provideChatSandboxPanel } from '@/composables/useChatSandboxPanel';
 import SandboxSidePanel from '@/components/chat/SandboxSidePanel.vue';
 import BrowserTaskPreview from './components/BrowserTaskPreview.vue';
+import PendingPromptDock from './components/PendingPromptDock.vue';
+import { providePromptDock } from '@/composables/usePromptDock';
 import { collectSessionArtifacts, markSessionArtifactDeleted } from '@/utils/sessionArtifacts';
 import { isCollectingSkillArtifacts } from '@/utils/skillArtifacts';
 const referencesDrawer = provideChatReferencesDrawer();
 provideChatAttachmentPreviewDrawer();
 const sandboxPanel = provideChatSandboxPanel();
-const { visible: referencesDrawerVisible } = referencesDrawer;
+const { visible: referencesDrawerVisible, panelWidth: referencesPanelWidth } = referencesDrawer;
 
 const props = defineProps({
     session_id: { type: String, default: '' },
@@ -326,6 +333,7 @@ const inputFieldRef = ref();
 const created_at = ref('');
 const limit = ref(20);
 const messagesList = reactive([]);
+providePromptDock(messagesList);
 
 function forkAffordanceOf(messageId) {
     if (!messageId) return { canFork: false }
@@ -566,11 +574,16 @@ const isFirstEnter = ref(true);
 const loading = ref(false);
 const sessionActivity = useSessionActivityStore();
 const activitySessionId = ref('');
-watch([activitySessionId, isReplying, isStreaming, isImRecovering, currentAssistantMessageId], () => {
+watch([activitySessionId, isReplying, isImRecovering, currentAssistantMessageId], () => {
     if (props.embeddedMode || !activitySessionId.value) return;
-    sessionActivity.update(activitySessionId.value, isReplying.value || isStreaming.value || isImRecovering.value, currentAssistantMessageId.value);
+    // SSE may stay connected after a stop/complete event. The sidebar tracks
+    // generation, not the transport, just like the composer's Stop button.
+    sessionActivity.update(activitySessionId.value, isReplying.value || isImRecovering.value, currentAssistantMessageId.value);
 }, { flush: 'sync' });
 const historyLoading = ref(true);
+watch(activitySessionId, (id) => {
+    if (!props.embeddedMode) sessionActivity.setViewing(id);
+}, { flush: 'sync' });
 const historyLoadingMore = ref(false);
 const hasMoreHistory = ref(true);
 
@@ -585,14 +598,19 @@ let fullContent = ref('')
 const scrollContainer = ref(null)
 const composerElement = ref(null)
 const composerHeight = ref(0)
-// Keep floating previews above the sticky composer, including when its controls
-// wrap after a drawer opens or the user adds multiple lines/attachments.
-watch(composerElement, (element, _, onCleanup) => {
-    if (!element) return
-    const measure = () => { composerHeight.value = element.offsetHeight }
+const scrollbarGutter = ref(0)
+// Reserve space for the independent composer and keep it aligned with the
+// message column when drawers, multiline input or attachments change its size.
+watch([composerElement, scrollContainer], ([element, scroller], _, onCleanup) => {
+    if (!element || !scroller) return
+    const measure = () => {
+        composerHeight.value = element.offsetHeight
+        scrollbarGutter.value = scroller.offsetWidth - scroller.clientWidth
+    }
     measure()
     const observer = new ResizeObserver(measure)
     observer.observe(element)
+    observer.observe(scroller)
     onCleanup(() => observer.disconnect())
 }, { flush: 'post' })
 const userHasScrolledUp = ref(false)
@@ -698,6 +716,7 @@ const loadFollowUpSuggestions = async (message, ensure = false, regenerate = fal
     const messageId = resolveAssistantMessageId(message);
     const targetSessionId = session_id.value;
     if (!messageId || !targetSessionId || message.suggestionsDismissed) return;
+    if (isAwaitingInput(message)) return;
     message.suggestionLoading = true;
     try {
         let response = ensure
@@ -912,6 +931,7 @@ const {
     handleMsgList,
     processStreamChunk,
     prepareForNewOutgoingMessage,
+    prepareResumedMessage,
     markInFlightAssistantStopped,
 } = useChatStreamHandler({
     messagesList,
@@ -943,7 +963,7 @@ const {
         const lastMessage = findLastMessage(
             (message) => message.role === 'assistant' && !message.is_completed
         );
-        const locallyRunning = isReplying.value || isStreaming.value || isImRecovering.value;
+        const locallyRunning = isReplying.value || isImRecovering.value;
         // History reload can finish after sendMsg already marked this session
         // running. Do not clear that marker just because the snapshot's last
         // message still looks completed. A scanned incomplete assistant counts: a
@@ -1289,7 +1309,7 @@ const attachSteerFollowUp = async (completedAssistantId) => {
             if (sessionChanged()) return;
             const batch = res?.data || [];
             const newAssistant = [...batch].reverse().find((m) =>
-                m.role === 'assistant' && !m.is_completed && m.id && m.id !== completedAssistantId
+                m.role === 'assistant' && !m.is_completed && !isAwaitingInput(m) && m.id && m.id !== completedAssistantId
             );
             if (newAssistant) {
                 // The follow-up run persists its query under its own
@@ -1362,6 +1382,7 @@ const attachSteerFollowUp = async (completedAssistantId) => {
 
 const sendMsg = async (value, modelId = '', mentionedItems = [], imageFiles = [], attachmentFiles = [], options = {}) => {
     if (composerLocked.value) return
+    const reasoningEffort = props.embeddedMode ? undefined : (useSettingsStoreInstance.reasoningEffortOverride || undefined);
     stopStream();
     prepareForNewOutgoingMessage();
     activitySessionId.value = String(session_id.value);
@@ -1531,6 +1552,7 @@ const sendMsg = async (value, modelId = '', mentionedItems = [], imageFiles = []
         web_search_enabled: webSearchEnabled,
         local_browser_enabled: !props.embeddedMode && agentEnabled && useSettingsStoreInstance.isLocalBrowserEnabled && !useBrowserConnectionStore().knownOffline,
         summary_model_id: modelId,
+        reasoning_effort: reasoningEffort,
         mcp_service_ids: requestMcpServiceIds,
         skill_names: requestSkillNames,
         tag_ids: tagIds,
@@ -1594,8 +1616,48 @@ const recoverIncompleteMessage = () => {
 };
 
 // Watch for stream errors and show message
+// Answering a suspended prompt resumes its run on the server; follow it on
+// the same assistant message. The resumed stream may not exist yet when the
+// answer returns, so attaching retries briefly.
+let attachingResumedRun = false;
+const resumeSuspendedRun = async (pendingId) => {
+    const sessionId = session_id.value;
+    const message = findLastMessage((m) => m.role === 'assistant' && (m.agentEventStream || []).some(
+        (e) => isPromptCard(e) && e.pending_id === pendingId,
+    ));
+    if (!message || !sessionId || isReplying.value) return;
+    const resumeId = persistedAssistantId(message);
+    prepareResumedMessage(message, pendingId);
+    isReplying.value = true;
+    currentAssistantMessageId.value = resumeId;
+    attachingResumedRun = true;
+    try {
+        for (let attempt = 0; attempt < 10; attempt++) {
+            await new Promise((resolve) => setTimeout(resolve, 500));
+            if (session_id.value !== sessionId) return;
+            await startStream({
+                session_id: sessionId,
+                query: resumeId,
+                method: 'GET',
+                url: '/api/v1/sessions/continue-stream',
+            });
+            if (!error.value) return;
+        }
+    } finally {
+        attachingResumedRun = false;
+    }
+    if (error.value && session_id.value === sessionId) {
+        MessagePlugin.error(error.value);
+        isReplying.value = false;
+        loading.value = false;
+        currentAssistantMessageId.value = '';
+    }
+};
+provide(resumeSuspendedRunKey, resumeSuspendedRun);
+
 watch(error, (newError) => {
     if (!newError) return;
+    if (attachingResumedRun) return;
     // A failed attach to an in-flight IM reply isn't a real error — the answer is
     // produced on the IM side and never streams here. Recover quietly by polling to
     // completion instead of flashing a "stream failed" toast. Web/api replies fall
@@ -1767,7 +1829,7 @@ onBeforeRouteUpdate((to, from, next) => {
 
     &.has-references-panel:not(.is-embedded) {
         @media (min-width: 960px) {
-            padding-right: 420px;
+            padding-right: var(--references-panel-width, 420px);
             box-sizing: border-box;
 
             .chat_scroll_box {
@@ -1787,7 +1849,7 @@ onBeforeRouteUpdate((to, from, next) => {
 
     &.has-sandbox-panel.has-references-panel:not(.is-embedded) {
         @media (min-width: 1400px) {
-            padding-right: calc(420px + var(--sandbox-panel-width, 420px));
+            padding-right: calc(var(--references-panel-width, 420px) + var(--sandbox-panel-width, 420px));
         }
 
         @media (max-width: 1399.98px) and (min-width: 960px) {
@@ -1886,6 +1948,7 @@ onBeforeRouteUpdate((to, from, next) => {
     padding: 8px 0 0;
     box-sizing: border-box;
     overflow-y: auto;
+    // Keep native message bounce without chaining scroll to the outer page.
     overscroll-behavior-y: contain;
     scroll-padding-bottom: var(--chat-composer-height, 0px);
     scrollbar-gutter: stable;
@@ -1916,20 +1979,27 @@ onBeforeRouteUpdate((to, from, next) => {
     }
 }
 
-// One scroll viewport spans the messages and composer, so the scrollbar reaches
-// the bottom of the chat column. The composer stays in flow to reserve its own
-// height, and sticks to the bottom while reading earlier messages.
+// Keep the full-height message scrollbar and reserve space below the last
+// message for the composer, which sits outside the bouncing scroll viewport.
 .chat_scroll_content {
     display: flex;
     flex-direction: column;
     min-height: 100%;
+
+    // Use an in-flow spacer so the content ResizeObserver also detects composer
+    // height changes and keeps the last message visible when following replies.
+    &::after {
+        content: '';
+        flex: 0 0 var(--chat-composer-height, 0px);
+    }
 }
 
 .chat_composer {
-    position: sticky;
+    position: absolute;
     bottom: 0;
+    left: 0;
+    right: var(--chat-scrollbar-gutter, 0px);
     z-index: 12;
-    flex-shrink: 0;
     padding: 16px 0 max(8px, env(safe-area-inset-bottom));
     background: var(--td-bg-color-container);
 }
@@ -2140,13 +2210,54 @@ onBeforeRouteUpdate((to, from, next) => {
 
 <style lang="less">
 .chat-rewind-popconfirm {
-    max-width: 260px;
+    .t-popconfirm__content {
+        width: 280px;
+        max-width: calc(100vw - 24px);
+        padding: 14px 16px 12px;
+        box-sizing: border-box;
+    }
 
-    .t-popconfirm__content,
-    .t-popup__content {
-        max-width: 260px;
+    .t-popconfirm__body {
+        gap: 8px;
+    }
+
+    .t-popconfirm__body > .t-icon {
+        flex-shrink: 0;
+        margin: 0;
+        padding: 3px 0 0;
+        font-size: var(--app-text-xl);
+    }
+
+    .t-popconfirm__inner {
+        flex: 1;
+        min-width: 0;
+        max-width: none;
         white-space: normal;
-        line-height: 1.5;
+    }
+
+    .chat-rewind-confirm__title {
+        font-size: var(--app-text-base);
+        font-weight: 500;
+        line-height: 22px;
+        color: var(--td-text-color-primary);
+    }
+
+    .chat-rewind-confirm__body {
+        margin-top: 2px;
+        font-size: var(--app-text-md);
+        line-height: 20px;
+        color: var(--td-text-color-secondary);
+    }
+
+    .t-popconfirm__buttons {
+        display: flex;
+        justify-content: flex-end;
+        gap: 8px;
+        margin-top: 12px;
+
+        .t-popconfirm__confirm {
+            margin-left: 0;
+        }
     }
 }
 </style>
